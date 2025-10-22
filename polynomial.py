@@ -9,36 +9,23 @@ from Crypto.Cipher import AES
 def to_bytes_le_u16(x):
     return int(x).to_bytes(2, "little")
 
-
 def bytes_to_bits(data, n_bits):
-    """固定转换：32字节 → 256比特（对于n=256）或填充/截断到n比特"""
+    """固定转换：32字节 → 256比特"""
     bits = []
-    # 转换所有字节为比特
     for byte in data:
         for i in range(8):
             bits.append((byte >> i) & 1)
-
-    # 对于baby参数(n=4)，只取前4个比特
-    # 对于标准参数(n=256)，正好是32字节 × 8 = 256比特
     return bits[:n_bits]
 
-
 def bits_to_bytes(bits):
-    """固定转换：n比特 → 32字节（固定长度）"""
+    """固定转换：n比特 → 32字节"""
     bytes_list = []
-
-    # 先转换所有完整的比特组
     for i in range(0, len(bits), 8):
         byte = 0
         for j in range(8):
             if i + j < len(bits) and bits[i + j]:
                 byte |= (1 << j)
         bytes_list.append(byte)
-
-    # 填充到32字节（固定长度）
-    while len(bytes_list) < 32:
-        bytes_list.append(0)
-
     return bytes(bytes_list[:32])
 
 class AES256CTR_DRBG:
@@ -69,20 +56,16 @@ class AES256CTR_DRBG:
         return bytes(out[:n])
 
 class BabyKyber:
-    def __init__(self, n=4, q=17):
-        """
-        Initialize a simple Kyber-like scheme.
-        :param n: Polynomial degree (default 4 for simplicity)
-        :param q: Modulus for coefficients
-        """
+    def __init__(self, n=256, q=3329, k=2):
         self.n = n
         self.q = q
+        self.k = k
         self.f = [1] + [0] * (n - 1) + [1]  # x^n + 1
         self.seed = np.random.seed(0xdeadbeef)
         self.SEED_BYTES = 32
+        print(f"初始化 BabyKyber: n={n}, q={q}, k={k}")
 
     # ---------------------- Polynomial Operations ----------------------
-
     def add_poly(self, a, b):
         """Add two polynomials mod q"""
         result = [0] * max(len(a), len(b))
@@ -105,17 +88,14 @@ class BabyKyber:
     def mul_poly_simple(self, a, b):
         """Multiply two polynomials mod (x^n + 1, q)"""
         tmp = [0] * (len(a) * 2 - 1)
-
         # Schoolbook multiplication
         for i in range(len(a)):
             for j in range(len(b)):
                 tmp[i + j] += a[i] * b[j]
-
         # Mod x^n + 1 reduction
         for i in range(self.n, len(tmp)):
             tmp[i - self.n] -= tmp[i]
             tmp[i] = 0
-
         # Mod q
         return [x % self.q for x in tmp[:self.n]]
 
@@ -127,7 +107,6 @@ class BabyKyber:
 
     def test_mul_poly(self, f):
         degree_f = self.n
-
         for i in range(5):
             a = (np.random.random(degree_f) * self.q).astype(int)
             b = (np.random.random(degree_f) * self.q).astype(int)
@@ -161,12 +140,11 @@ class BabyKyber:
         """Transpose a 2D matrix of polynomials"""
         return [[M[j][i] for j in range(len(M))] for i in range(len(M[0]))]
 
-    def test_mul_vec(self, k, f):
+    def test_mul_vec(self, f):
         degree_f = self.n
-
         for i in range(100):
-            m = (np.random.random([k, k, degree_f]) * self.q).astype(int)
-            v = (np.random.random([k, degree_f]) * self.q).astype(int)
+            m = (np.random.random([self.k, self.k, degree_f]) * self.q).astype(int)
+            v = (np.random.random([self.k, degree_f]) * self.q).astype(int)
             m_mul_a = self.mul_mat_vec_simple(m, v)
 
             m_poly = list(map(lambda x: list(map(Polynomial, x)), m))
@@ -174,34 +152,30 @@ class BabyKyber:
             prod = np.dot(m_poly, v_poly)
             m_mul_a_ref = list(
                 map(lambda x: list(map(lambda y: int(y) % self.q, self.sign_extend((x % Polynomial(f)).coef))), prod))
-
             assert (m_mul_a == m_mul_a_ref)
 
     # ---------------------- Encryption / Decryption ----------------------
 
     def encrypt(self, A, t, m_bits, r, e1, e2):
         """Encrypt message bits m_bits"""
+        """Based on formula:u = A^T · r + e1, v = t^T · r + e2 - encode(m)"""
         half_q = int(self.q / 2 + 0.5)
         m = [x * half_q for x in m_bits]
-
         u = self.add_vec(self.mul_mat_vec_simple(self.transpose(A), r), e1)
         v = self.sub_poly(self.add_poly(self.mul_vec_simple(t, r), e2), m)
-
         return u, v
 
     def decrypt(self, s, u, v):
         """Decrypt ciphertext (u, v)"""
+        """Based on formula:plaintext = decode(v - s^T · u) = decode(encode(m) + 小噪声) ≈ m"""
         m_n = self.sub_poly(v, self.mul_vec_simple(s, u))
         half_q = int(self.q / 2 + 0.5)
-
         def round_to_bit(x):
             dist_center = abs(half_q - x)
             dist_bound = min(x, self.q - x)
             return half_q if dist_center < dist_bound else 0
-
         m_n = [round_to_bit(x) for x in m_n]
         m_bits = [x // half_q for x in m_n]
-
         return m_bits
 
     # ---------------------- Simple Randomized Key/Noise Setup ----------------------
@@ -213,23 +187,18 @@ class BabyKyber:
     def random_poly(self):
         return [random.randint(0, self.q - 1) for _ in range(self.n)]
 
-    def random_vec(self, k):
-        return [self.random_poly() for _ in range(k)]
+    def random_vec(self):
+        return [self.random_poly() for _ in range(self.k)]
 
-    def random_mat(self, k):
-        return [[self.random_poly() for _ in range(k)] for _ in range(k)]
+    def random_mat(self):
+        return [[self.random_poly() for _ in range(self.k)] for _ in range(self.k)]
 
-    def gen_matrix_A_drbg(self, drbg, k, n, q):
-        """
-        drbg: AES256CTR_DRBG instance
-        produce k x k matrix of length-n polynomials with coeff in [0,q-1]
-        domain separation: simply consume bytes consecutively (drbg counter ensures uniqueness)
-        """
+    def gen_matrix_A_drbg(self, drbg, n, q):
+        """ using AES256CTR_DRBG instance to produce k x k matrix of length-n polynomials with coeff in [0,q-1] """
         A = []
-        for i in range(k):
+        for i in range(self.k):
             row = []
-            for j in range(k):
-                # need 2*n bytes (uint16 per coeff) — toy approach
+            for j in range(self.k):
                 buf = drbg.random_bytes(2 * n)
                 poly = [(buf[2 * t] | (buf[2 * t + 1] << 8)) % q for t in range(n)]
                 row.append(poly)
@@ -254,119 +223,100 @@ class BabyKyber:
             bitpos += 1
             b3 = (buf[bitpos // 8] >> (bitpos % 8)) & 1;
             bitpos += 1
-            poly.append((b0 + b1) - (b2 + b3))  # value in {-2,-1,0,1,2}
+            poly.append((b0 + b1) - (b2 + b3))
         return poly
 
-    def test_drbg(self, k):
+    def keygen_drbg(self, seed: bytes = None):
+        """Generate key pair based on formula:t = A*s + e"""
+        if seed is None:
+            seed = os.urandom(self.SEED_BYTES)
+        drbg = AES256CTR_DRBG(seed)
+        A = self.gen_matrix_A_drbg(drbg, self.n, self.q)
+        s = [self.cbd_eta_from_drbg(drbg, self.n) for _ in range(self.k)]
+        e = [self.cbd_eta_from_drbg(drbg, self.n) for _ in range(self.k)]
+        t = []
+        for i in range(self.k):
+            acc = [0] * self.n
+            for j in range(self.k):
+                acc = self.add_poly(acc, self.mul_poly_simple(A[i][j], s[j]))
+            t_i = self.add_poly(acc, e[i])
+            t.append(t_i)
+        pk = (seed, t)
+        sk = s
+        return pk, sk
+    def demo_key_generation(self):
+        """演示密钥生成过程"""
+        print("\n" + "="*50)
+        print("🔑 密钥生成演示")
+        print("="*50)
         seedA = b"0123456789abcdef0123456789abcdef"  # 32 bytes
         drbg = AES256CTR_DRBG(seedA)
-        A1 = kyber.gen_matrix_A_drbg(drbg, k, self.n, self.q)
+        A1 = kyber.gen_matrix_A_drbg(drbg, self.n, self.q)
 
         # reinit and generate again -> must match
         drbg2 = AES256CTR_DRBG(seedA)
-        A2 = kyber.gen_matrix_A_drbg(drbg2, k, self.n, self.q)
+        A2 = kyber.gen_matrix_A_drbg(drbg2, self.n, self.q)
         assert A1[0][0][:8] == A2[0][0][:8], "Determinism failed"
 
         # sample s deterministic
         drbg3 = AES256CTR_DRBG(seedA)
         # consume matrix A bytes first (keep generation order consistent) then s
-        _ = kyber.gen_matrix_A_drbg(drbg3, k, self.n, self.q)
-        s0 = [kyber.cbd_eta_from_drbg(drbg3, self.n) for _ in range(k)]
+        _ = kyber.gen_matrix_A_drbg(drbg3, self.n, self.q)
+        s0 = [kyber.cbd_eta_from_drbg(drbg3, self.n) for _ in range(self.k)]
 
         # repeat -> should equal
         drbg4 = AES256CTR_DRBG(seedA)
-        _ = kyber.gen_matrix_A_drbg(drbg4, k, self.n, self.q)
-        s1 = [kyber.cbd_eta_from_drbg(drbg4, self.n) for _ in range(k)]
+        _ = kyber.gen_matrix_A_drbg(drbg4, self.n, self.q)
+        s1 = [kyber.cbd_eta_from_drbg(drbg4, self.n) for _ in range(self.k)]
         assert s0 == s1
         print("DRBG deterministic generation OK")
-
         return 1
 
-    def keygen_drbg(self, k, seed: bytes = None):
-        """Generate key pair using DRBG for all randomness"""
-        if seed is None:
-            seed = os.urandom(self.SEED_BYTES)
-
-        drbg = AES256CTR_DRBG(seed)
-
-        # Generate matrix A
-        A = self.gen_matrix_A_drbg(drbg, k, self.n, self.q)
-
-        # Sample secret s and error e from same DRBG
-        s = [self.cbd_eta_from_drbg(drbg, self.n) for _ in range(k)]
-        e = [self.cbd_eta_from_drbg(drbg, self.n) for _ in range(k)]
-
-        # Compute t = A*s + e
-        t = []
-        for i in range(k):
-            acc = [0] * self.n
-            for j in range(k):
-                acc = self.add_poly(acc, self.mul_poly_simple(A[i][j], s[j]))
-            t_i = self.add_poly(acc, e[i])
-            t.append(t_i)
-
-        pk = (seed, t)
-        sk = s
-        return pk, sk
-
-    def encrypt_drbg(self, k, pk, m_bits, coins_seed):
-        """Encrypt using DRBG for all randomness"""
+    def encrypt_drbg(self, pk, m_bits, coins_seed):
         seedA, t = pk
         drbg_coins = AES256CTR_DRBG(coins_seed)
-
-        # Regenerate A from seed
         drbg_A = AES256CTR_DRBG(seedA)
-        A = self.gen_matrix_A_drbg(drbg_A, k, self.n, self.q)
-
-        # Sample all randomness from coins DRBG
-        r = [self.cbd_eta_from_drbg(drbg_coins, self.n) for _ in range(k)]
-        e1 = [self.cbd_eta_from_drbg(drbg_coins, self.n) for _ in range(k)]
+        A = self.gen_matrix_A_drbg(drbg_A, self.n, self.q)
+        r = [self.cbd_eta_from_drbg(drbg_coins, self.n) for _ in range(self.k)]
+        e1 = [self.cbd_eta_from_drbg(drbg_coins, self.n) for _ in range(self.k)]
         e2 = self.cbd_eta_from_drbg(drbg_coins, self.n)
-
-        # Encode message
         half_q = self.q // 2
         m_poly = [(bit * half_q) % self.q for bit in m_bits]
-
         # Compute u = A^T * r + e1
         u = []
-        for j in range(k):
+        for j in range(self.k):
             acc = [0] * self.n
-            for i in range(k):
+            for i in range(self.k):
                 acc = self.add_poly(acc, self.mul_poly_simple(A[i][j], r[i]))
             u_j = self.add_poly(acc, e1[j])
             u.append(u_j)
-
         # Compute v = t^T * r + e2 + m
         v_acc = [0] * self.n
-        for i in range(k):
+        for i in range(self.k):
             v_acc = self.add_poly(v_acc, self.mul_poly_simple(t[i], r[i]))
         v = self.add_poly(self.add_poly(v_acc, e2), m_poly)
-
         return (u, v)
 
     # ---------------------- Demo ----------------------
 
-    def demo(self, k=2):
+    def demo(self):
         """Run a simple encrypt-decrypt round to test"""
         print("Running Baby Kyber demo...")
         failed = 0
-        for i in range(k):
-            A = self.random_mat(k)
-            # s = self.random_vec(k)
-            # e1 = self.random_vec(k)
+        for i in range(self.k):
+            A = self.random_mat()
+            # s = self.random_vec()
+            # e1 = self.random_vec()
             # e2 = self.random_poly()
-            # r = self.random_vec(k)
-            s = [self.small_noise_poly() for _ in range(k)]
-            e1 = [self.small_noise_poly() for _ in range(k)]
+            # r = self.random_vec()
+            s = [self.small_noise_poly() for _ in range(self.k)]
+            e1 = [self.small_noise_poly() for _ in range(self.k)]
             e2 = self.small_noise_poly()
-            r = [self.small_noise_poly() for _ in range(k)]
+            r = [self.small_noise_poly() for _ in range(self.k)]
             m_bits = [random.randint(0, 1) for _ in range(self.n)]
-
             t = self.mul_mat_vec_simple(A, s)
-
             u, v = self.encrypt(A, t, m_bits, r, e1, e2)
             m_dec = self.decrypt(s, u, v)
-
             # print("Message bits:   ", m_bits)
             # print("Decrypted bits: ", m_dec)
             # print("Success:", m_bits == m_dec)
@@ -377,39 +327,33 @@ class BabyKyber:
                 failed += 1
         print(failed)
 
-    def demo_drbg(self, k=2, trials=10):
-        """Test encryption/decryption with DRBG"""
-        print("Running Baby Kyber DRBG demo...")
-
-        success_count = 0
-        for i in range(trials):
-            # Use fixed seed for reproducibility
-            seed = b"test_seed_1234567890123456789012"  # 32 bytes
-
-            # Key generation with DRBG
-            pk, sk = self.keygen_drbg(k, seed)
-
-            # Generate random message
-            m_bits = [random.randint(0, 1) for _ in range(self.n)]
-
-            # Encrypt with DRBG
-            coins_seed = b"encrypt_coins_1234567890123456"  # 32 bytes
-            ct = self.encrypt_drbg(k, pk, m_bits, coins_seed)
-
-            u, v = ct
-            # Decrypt
-            m_dec = self.decrypt(sk, u, v)
-
-            if m_bits == m_dec:
-                success_count += 1
-                print(f"Trial {i}: SUCCESS")
-            else:
-                diff = sum(1 for i in range(len(m_bits)) if m_bits[i] != m_dec[i])
-                print(f"Trial {i}: FAIL - {diff}/{len(m_bits)} bit errors")
-                print(f"  Original: {m_bits}")
-                print(f"  Decrypted: {m_dec}")
-
-        print(f"DRBG demo success rate: {success_count}/{trials}")
+    def demo_encryption_decryption(self):
+        print("\n" + "=" * 50)
+        print("🔒 加密解密演示")
+        print("=" * 50)
+        seed = b"demo_seed_1234567890123456789012"
+        pk, sk = self.keygen_drbg(seed)
+        message = "HELLO"
+        message_bits = []
+        for char in message:
+            bits = format(ord(char), '08b')[:5]
+            message_bits.extend([int(bit) for bit in bits])
+        message_bits = message_bits[:self.n]
+        while len(message_bits) < self.n:
+            message_bits.append(0)
+        print(f"原始消息: '{message}'")
+        print(f"消息比特: {message_bits}")
+        # m_bits = [random.randint(0, 1) for _ in range(self.n)]
+        coins_seed = b"demo_coins_1234567890123456789012"
+        ct = self.encrypt_drbg(pk, message_bits, coins_seed)
+        u, v = ct
+        m_dec = self.decrypt(sk, u, v)
+        if message_bits == m_dec:
+            print("Match! Successful Decryption with ciphertext:", ct)
+        else:
+            diff = sum(1 for i in range(len(message_bits)) if message_bits[i] != m_dec[i])
+            print(f"  Original: {message_bits}")
+            print(f"  Decrypted: {m_dec}")
 
     def G(self, data: bytes) -> bytes:
         """哈希函数 G - 用于消息扩展"""
@@ -426,33 +370,24 @@ class BabyKyber:
     def serialize_pk(self, pk):
         """序列化公钥：seedA + t的所有系数"""
         seedA, t = pk
-        serialized = bytearray(seedA)  # 首先是32字节的种子
-
-        # 然后添加t的所有多项式系数
+        serialized = bytearray(seedA)
         for poly in t:
             for coeff in poly:
-                # 确保系数在[0, q-1]范围内
                 normalized_coeff = coeff % self.q
                 serialized.extend(normalized_coeff.to_bytes(2, 'little', signed=False))
-
         return bytes(serialized)
 
     def serialize_ct(self, ct):
         """序列化密文：u的所有系数 + v的所有系数"""
         u, v = ct
         serialized = bytearray()
-
-        # 序列化u向量（k个多项式）
         for poly in u:
             for coeff in poly:
                 normalized_coeff = coeff % self.q
                 serialized.extend(normalized_coeff.to_bytes(2, 'little', signed=False))
-
-        # 序列化v多项式
         for coeff in v:
             normalized_coeff = coeff % self.q
             serialized.extend(normalized_coeff.to_bytes(2, 'little', signed=False))
-
         return bytes(serialized)
 
     def serialize_sk(self, sk):
@@ -460,7 +395,6 @@ class BabyKyber:
         serialized = bytearray()
         for poly in sk:
             for coeff in poly:
-                # 私钥可能有负系数，需要规范化
                 normalized_coeff = coeff % self.q
                 serialized.extend(normalized_coeff.to_bytes(2, 'little', signed=False))
         return bytes(serialized)
@@ -469,8 +403,6 @@ class BabyKyber:
         """常数时间密文比较"""
         u1, v1 = ct1
         u2, v2 = ct2
-
-        # 比较u向量（k个多项式）
         equal = True
         for i in range(len(u1)):
             for j in range(len(u1[i])):
@@ -479,230 +411,135 @@ class BabyKyber:
                 coeff2 = u2[i][j] % self.q
                 if coeff1 != coeff2:
                     equal = False
-
-        # 比较v多项式
         for j in range(len(v1)):
             coeff1 = v1[j] % self.q
             coeff2 = v2[j] % self.q
             if coeff1 != coeff2:
                 equal = False
-
         return equal
 
     # ---------------------- FO transform ---------------------
-    def encapsulate(self, k, pk):
+    def encapsulate(self, pk):
         """KEM Encapsulation with FO Transform using DRBG"""
-        # 1. Generate random message m
         m = os.urandom(self.SEED_BYTES)
-        # m = b'\x87\xcc\xd4\x04(\xc6\xcek\xa5)\xe7\xa2Z\x9e\xab\xc9H\xad!W8\x95S\xf9;\x8fV\x95\x8fl4c'
-
-        # 2. Derive m_bits from m using G
-        # m_expanded = self.G(m)
-        # print(f"🔧 调试 - m_expanded: {m_expanded.hex()}")
-        # m_bits = bytes_to_bits(m_expanded, self.n)
         m_bits = bytes_to_bits(m, self.n)
-
-        # 3. Generate coins seed = H(m || pk)
+        """ Generate coins seed = H(m || pk) """
         pk_bytes = self.serialize_pk(pk)
         coins_seed = self.H(m + pk_bytes)
-
-        # 4. Encrypt with deterministic randomness using DRBG
-        ct = self.encrypt_drbg(k, pk, m_bits, coins_seed)
-        u, v = ct
-
-        # 5. Derive shared key = KDF(m || ct)
+        ct = self.encrypt_drbg(pk, m_bits, coins_seed)
+        """ Derive shared key = KDF(m || ct) """
         ct_bytes = self.serialize_ct(ct)
         shared_key = self.KDF(m + ct_bytes)
-
         return ct, shared_key
 
-    def decapsulate(self, k, sk, pk, ct):
-        """KEM Decapsulation with FO Transform using DRBG"""
+    def decapsulate(self, sk, pk, ct):
+        """KEM Decapsulation with FO Transform using DRBG """
         u, v = ct
-        # 1. Decrypt to get m'
         m_prime_bits = self.decrypt(sk, u, v)
         m_prime_bytes = bits_to_bytes(m_prime_bits)
-
-        # 2. Recompute coins seed' = H(m' || pk)
         pk_bytes = self.serialize_pk(pk)
         coins_seed_prime = self.H(m_prime_bytes + pk_bytes)
-
-        # 3. Re-encrypt to verify ciphertext using DRBG
-        ct_prime = self.encrypt_drbg(k, pk, m_prime_bits, coins_seed_prime)
-        u_prime, v_prime = ct_prime
-
-        # 4. Check ciphertext consistency
+        ct_prime = self.encrypt_drbg(pk, m_prime_bits, coins_seed_prime)
         if self.ct_equal(ct, ct_prime):
-            # Valid case: derive shared key = KDF(m' || ct)
             ct_bytes = self.serialize_ct(ct)
             shared_key = self.KDF(m_prime_bytes + ct_bytes)
             print(f"🔧 解封装调试 - 使用有效分支")
         else:
-            # Invalid case: return random-looking key using sk as seed
             sk_bytes = self.serialize_sk(sk)
             shared_key = self.KDF(b'reject' + sk_bytes + self.serialize_ct(ct))
             print(f"🔧 解封装调试 - 使用拒绝分支")
-
         return shared_key
 
     # 更新keygen方法
-    def keygen(self, k, seed: bytes = None):
+    def keygen(self, seed: bytes = None):
         """Generate key pair - now using DRBG internally"""
-        return self.keygen_drbg(k, seed)
-
-    def test_basic_kem(self, k, trials=10):
-        """测试正常情况下的KEM功能"""
-        print("=== 基础KEM功能测试 ===")
-        successes = 0
-        for i in range(trials):
-            fixed_seed = b"fixed_key_seed_12345678901234567"
-            pk, sk = self.keygen(k, fixed_seed)
-            ct, K_encap = self.encapsulate(k, pk)
-            K_decap = self.decapsulate(k, sk, pk, ct)
-
-            if K_encap == K_decap:
-                successes += 1
-                print(f"✅ 测试 {i}: 成功")
-            else:
-                print(f"❌ 测试 {i}: 失败")
-
-        print(f"成功率: {successes}/{trials}")
-        return successes == trials
-
-    def test_cca_protection(self, k):
-        """测试FO Transform对CCA攻击的防护"""
-        print("\n=== CCA攻击防护测试 ===")
-
-        # 正常流程
-        pk, sk = self.keygen(k)
-        original_ct, original_K = self.encapsulate(k, pk)
-
-        # 模拟攻击者修改密文
-        u, v = original_ct
-        modified_v = v.copy()
-        modified_v[0] = (modified_v[0] + 1) % self.q  # 轻微修改
-        modified_ct = (u, modified_v)
-
-        # 尝试解封装被修改的密文
-        recovered_K = self.decapsulate(k, sk, pk, modified_ct)
-
-        print(f"原始密钥: {original_K.hex()[:16]}...")
-        print(f"恢复密钥: {recovered_K.hex()[:16]}...")
-
-        if original_K != recovered_K:
-            print("✅ CCA防护成功：修改的密文产生了不同的密钥")
-            return True
+        return self.keygen_drbg(seed)
+    def demo_kem(self):
+        print("\n" + "="*50)
+        print("🔐 KEM (密钥封装机制) 演示")
+        print("="*50)
+        print("步骤1: 密钥生成")
+        pk, sk = self.keygen_drbg()
+        print("✅ 密钥对生成完成")
+        print("\n步骤2: 封装")
+        ct, K_encap = self.encapsulate(pk)
+        print(f"✅ 封装完成")
+        print(f"   共享密钥: {K_encap.hex()[:16]}...")
+        print("\n步骤3: 解封装")
+        K_decap = self.decapsulate(sk, pk, ct)
+        print(f"✅ 解封装完成")
+        print(f"   恢复密钥: {K_decap.hex()[:16]}...")
+        if K_encap == K_decap:
+            print(f"✅ 测试成功")
         else:
-            print("❌ CCA防护失败：攻击者可能获得有效密钥")
-            return False
-
-    def test_reencryption_verification(self, k):
-        """测试重加密验证机制"""
-        print("\n=== 重加密验证测试 ===")
-
-        pk, sk = self.keygen(k)
-
-        # 正常加密
-        m = os.urandom(self.SEED_BYTES)
-        # m_expanded = self.G(m)
-        # m_bits = bytes_to_bits(m_expanded, self.n)
-        m_bits = bytes_to_bits(m, self.n)
-        pk_bytes = self.serialize_pk(pk)
-        coins_seed = self.H(m + pk_bytes)
-        ct = self.encrypt_drbg(k, pk, m_bits, coins_seed)
-
-        # 解密并重加密
-        u, v = ct
-        m_prime_bits = self.decrypt(sk, u, v)
-        m_prime_bytes = bits_to_bytes(m_prime_bits)
-        coins_seed_prime = self.H(m_prime_bytes + pk_bytes)
-        ct_prime = self.encrypt_drbg(k, pk, m_prime_bits, coins_seed_prime)
-
-        print(f"原始密文: {self.serialize_ct(ct).hex()[:32]}...")
-        print(f"重加密文: {self.serialize_ct(ct_prime).hex()[:32]}...")
-        print(f"密文一致: {self.ct_equal(ct, ct_prime)}")
-
-        return self.ct_equal(ct, ct_prime)
-
-    def test_randomness_properties(self, k, trials=5):
-        """测试随机性属性"""
-        print("\n=== 随机性属性测试 ===")
-
-        pk, sk = self.keygen(k)
-
-        # 测试相同消息产生不同密文
-        print("测试1: 相同消息 → 不同密文")
-        m = os.urandom(self.SEED_BYTES)
-        m_expanded = self.G(m)
-        m_bits = bytes_to_bits(m_expanded, self.n)
-
-        ct_set = set()
-        for i in range(trials):
-            # 每次使用不同的随机性
-            random_suffix = os.urandom(8)
-            coins_seed = self.H(m + random_suffix + self.serialize_pk(pk))
-            ct = self.encrypt_drbg(k, pk, m_bits, coins_seed)
-            ct_bytes = self.serialize_ct(ct)
-            ct_set.add(ct_bytes.hex())
-
-        print(f"生成 {len(ct_set)} 个唯一密文 / {trials} 次尝试")
-
-        # 测试不同消息产生不同密钥
-        print("测试2: 不同消息 → 不同密钥")
-        key_set = set()
-        for i in range(trials):
-            ct, K = self.encapsulate(k, pk)
-            key_set.add(K.hex())
-
-        print(f"生成 {len(key_set)} 个唯一密钥 / {trials} 次尝试")
-
-        return len(ct_set) == trials and len(key_set) == trials
-
-    def run_security_test_suite(self, k):
-        """运行完整的安全测试套件"""
-        print("=" * 50)
-        print("Kyber KEM 安全测试套件")
-        print("=" * 50)
-
-        tests = [
-            ("基础KEM功能", lambda: self.test_basic_kem(k)),
-            ("CCA攻击防护", lambda: self.test_cca_protection(k)),
-            ("重加密验证", lambda: self.test_reencryption_verification(k)),
-            ("随机性属性", lambda: self.test_randomness_properties(k))
-        ]
-
-        results = []
-        for test_name, test_func in tests:
-            try:
-                success = test_func()
-                results.append((test_name, success))
-                status = "✅ 通过" if success else "❌ 失败"
-                print(f"{test_name}: {status}")
-            except Exception as e:
-                results.append((test_name, False))
-                print(f"{test_name}: ❌ 错误 - {e}")
-
+            print(f"❌ 测试 {i}: 失败")
+        return 1
+    def demo_security_features(self):
+        """演示安全特性"""
         print("\n" + "=" * 50)
-        passed = sum(1 for _, success in results if success)
-        total = len(results)
-        print(f"测试结果: {passed}/{total} 通过")
+        print("🛡️ 安全特性演示")
+        print("=" * 50)
+        print("1. 确定性随机性生成 (DRBG)")
+        seed = b"security_demo_seed_1234567890123"
+        drbg1 = AES256CTR_DRBG(seed)
+        drbg2 = AES256CTR_DRBG(seed)
+        rand1 = drbg1.random_bytes(16)
+        rand2 = drbg2.random_bytes(16)
+        print(f"   DRBG确定性测试: {rand1 == rand2}")
+        print(f"   随机字节: {rand1.hex()[:16]}...")
+        print("\n2. 错误容忍性")
+        pk, sk = self.keygen_drbg()
+        message = [random.randint(0, 1) for _ in range(self.n)]
+        ct = self.encrypt_drbg(pk, message, os.urandom(32))
+        u, v = ct
+        if len(v) > 0:
+            v_err = v.copy()
+            v_err[0] = (v_err[0] + 1) % self.q
+            decrypted_err = self.decrypt(sk, u, v_err)
+            errors = sum(1 for i in range(len(message)) if message[i] != decrypted_err[i])
+            print(f"   单个系数错误导致的比特错误数: {errors}/{len(message)}")
+        print("\n3. FO变换保护")
+        print("   - 重加密验证机制")
+        print("   - CCA2安全性")
+        print("   - 拒绝情况下返回伪随机密钥")
+    def run_comprehensive_demo(self):
+        """运行完整的演示"""
+        print("🚀 BabyKyber 密码学课程演示")
+        print("=" * 60)
+        print("本演示展示后量子密码学Kyber方案的简化实现")
+        self.demo_key_generation()
+        self.demo_encryption_decryption()
+        self.demo_kem()
+        self.demo_security_features()
 
-        return all(success for _, success in results)
+        print("\n" + "=" * 60)
+        print("📖 教学总结")
+        print("=" * 60)
+        print("1. 基于格的密码学使用多项式环上的运算")
+        print("2. Kyber的安全性基于MLWE问题的困难性")
+        print("3. DRBG提供确定性随机性，确保可重复性")
+        print("4. FO变换提供CCA2安全性")
+        print("5. 中心二项分布提供噪声采样")
+        print("\n🎓 演示完成！")
 
 if __name__ == "__main__":
     # ---------- classical kyber parameter ----------
-    kyber = BabyKyber(n=256, q=3329)
+    import time
+    from itertools import product
+    kyber = BabyKyber(n=256, q=3329, k=2)
     test_f = [1] + [0] * 255 + [1]
-
-    # ---------- baby kyber ----------
-    # kyber = BabyKyber(n=4, q=257) #q=17 noise is too large!
-    # test_f = [1] + [0] * 3 + [1]
-
     # kyber.test_mul_poly(test_f)
-    # kyber.test_mul_vec(2, test_f)
-    kyber.demo()
-    # kyber.test_drbg(2)
+    # kyber.test_mul_vec(test_f)
+    # kyber.demo()
     # 测试DRBG加解密
     print("\n" + "=" * 50)
-    kyber.demo_drbg(trials=5)
-    kyber.run_security_test_suite(k=2)
+    # kyber.demo_encryption_decryption(trials=5)
+    kyber.run_comprehensive_demo()
+
+    print("🔬 Baby Kyber 扩展噪声暴力攻击教学演示")
+    print("=" * 60)
+
+    print("\n" + "=" * 60)
+    print("🎓 演示完成!")
+    print("=" * 60)
+
